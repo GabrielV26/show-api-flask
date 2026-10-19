@@ -2,18 +2,20 @@ from data import alchemy
 
 
 class UserModel(alchemy.Model):
-    __tablename__ = 'user'
+    __tablename__ = "user"
 
     id = alchemy.Column(alchemy.Integer, primary_key=True)
-    name = alchemy.Column(alchemy.String(80))
-    password = alchemy.Column(alchemy.String(80))
+    name = alchemy.Column(alchemy.String(80), nullable=False, unique=True)
+    # Werkzeug password hashes are longer than the original plaintext field.
+    password = alchemy.Column(alchemy.String(255), nullable=False)
 
     def __init__(self, name, password):
         self.name = name
         self.password = password
 
     def json(self):
-        return {'name': self.name, 'password': self.password}
+        # Never include password hashes or plaintext passwords in API responses.
+        return {"name": self.name}
 
     @classmethod
     def find_by_name(cls, name):
