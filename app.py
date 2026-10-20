@@ -1,4 +1,5 @@
 import hmac
+import math
 import os
 from datetime import datetime, timedelta
 
@@ -26,6 +27,8 @@ def create_app():
     )
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["PROPAGATE_EXCEPTIONS"] = False
+    # Bound request bodies to reduce memory exhaustion risk.
+    app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", "1048576"))
 
     alchemy.init_app(app)
 
@@ -38,18 +41,32 @@ def create_app():
 
         stored_password = account.password or ""
         if stored_password.startswith(("pbkdf2:", "scrypt:")):
-            valid = check_password_hash(stored_password, password)
+            try:
+                valid = check_password_hash(stored_password, password)
+            except (ValueError, TypeError):
+                # A corrupt hash must fail closed, not cause an authentication 500.
+                app.logger.warning("Invalid password hash for account id=%s", account.id)
+                return None
         else:
-            # One-time compatibility path for legacy plaintext passwords.
-            # Upgrade the password hash immediately after a successful login.
-            valid = hmac.compare_digest(stored_password, password)
+            # Temporary compatibility path for legacy plaintext passwords.
+            # Compare UTF-8 bytes so non-ASCII passwords work consistently.
+            valid = hmac.compare_digest(
+                stored_password.encode("utf-8"), password.encode("utf-8")
+            )
             if valid:
-                account.password = generate_password_hash(password)
-                alchemy.session.commit()
+                try:
+                    account.password = generate_password_hash(password)
+                    alchemy.session.commit()
+                except Exception:
+                    alchemy.session.rollback()
+                    app.logger.exception("Unable to upgrade legacy password hash")
+                    return None
 
         return account if valid else None
 
     def identity(payload):
+        if not isinstance(payload, dict):
+            return None
         username = payload.get("identity") or payload.get("user_name")
         if not isinstance(username, str):
             return None
@@ -72,6 +89,10 @@ def create_app():
     @app.errorhandler(400)
     def bad_request(_error):
         return jsonify({"message": "Requisição inválida."}), 400
+
+    @app.errorhandler(413)
+    def request_too_large(_error):
+        return jsonify({"message": "Corpo da requisição excede o limite permitido."}), 413
 
     @app.errorhandler(500)
     def internal_error(_error):
@@ -112,6 +133,9 @@ def create_app():
             new_user.save_to_db()
         except Exception:
             alchemy.session.rollback()
+            # Handles a duplicate created concurrently as well as other DB errors.
+            if user.UserModel.find_by_name(username):
+                return jsonify({"message": "Usuário já cadastrado."}), 409
             app.logger.exception("Unable to create user")
             return jsonify({"message": "Não foi possível criar o usuário."}), 500
 
@@ -149,8 +173,13 @@ def create_app():
         season = request_data.get("season")
         if not isinstance(episode_name, str) or not episode_name.strip() or len(episode_name.strip()) > 80:
             return jsonify({"message": "Informe um nome de episódio válido."}), 400
-        if isinstance(season, bool) or not isinstance(season, (int, float)) or season < 0:
-            return jsonify({"message": "season deve ser um número maior ou igual a zero."}), 400
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, (int, float))
+            or not math.isfinite(season)
+            or season < 0
+        ):
+            return jsonify({"message": "season deve ser um número finito maior ou igual a zero."}), 400
 
         parent = show.ShowModel.find_by_name(name)
         if not parent:
@@ -163,6 +192,7 @@ def create_app():
         return jsonify(new_episode.json()), 201
 
     with app.app_context():
+        # Creates missing tables only; this does NOT migrate existing schemas.
         alchemy.create_all()
 
     return app
@@ -175,4 +205,8 @@ if __name__ == "__main__":
     debug_enabled = os.environ.get("FLASK_DEBUG", "false").strip().lower() in {
         "1", "true", "yes", "on"
     }
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), debug=debug_enabled)
+    app.run(
+        host=os.environ.get("FLASK_HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "5000")),
+        debug=debug_enabled,
+    )
